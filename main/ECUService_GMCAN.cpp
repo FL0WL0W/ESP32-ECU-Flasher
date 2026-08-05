@@ -287,8 +287,21 @@ ECUServiceErrorCode ECUService_GMCAN::UnlockECU()
     return errorCode;
 }
 
-ECUServiceErrorCode ECUService_GMCAN::LoadKernel()
+ECUServiceErrorCode ECUService_GMCAN::LoadKernel(uint8_t *kernelData, uint32_t kernelSize, uint32_t kernelLoadAddress, uint32_t kernelRunAddress) 
 {
+    if(kernelData == nullptr || kernelSize == 0)
+    {
+        kernelData = _kernelData;
+        kernelSize = _kernelSize;
+    }
+    if(kernelLoadAddress == 0)
+    {
+        kernelLoadAddress = _kernelLoadAddress;
+    }
+    if(kernelRunAddress == 0)
+    {
+        kernelRunAddress = _kernelRunAddress;
+    }
     ECUServiceErrorCode errorCode = ECU_SERVICE_ERROR_NONE;
 
     uint8_t cmdProgrammingSession[] = {0x10, 0x02};
@@ -365,8 +378,8 @@ ECUServiceErrorCode ECUService_GMCAN::LoadKernel()
     errorCode = ECU_SERVICE_ERROR_NONE; // Reset error code to none since we are proceeding with the kernel load
 
     const uint32_t blockSize = 2048 - 6; // 2048 bytes minus the 6 bytes for the load command
-    const uint32_t totalBlocks = _kernelSize / blockSize; // Calculate the total number of blocks needed to send the kernel data
-    const uint32_t remainingBytes = _kernelSize % blockSize; // Calculate the remaining bytes that don't fit into a full block
+    const uint32_t totalBlocks = kernelSize / blockSize; // Calculate the total number of blocks needed to send the kernel data
+    const uint32_t remainingBytes = kernelSize % blockSize; // Calculate the remaining bytes that don't fit into a full block
     const uint32_t totalSizeWithHeaders = totalBlocks * (blockSize + 6) + (remainingBytes > 0 ? remainingBytes + 6 : 0); // Calculate the total size of the kernel data and headers to be sent
     uint32_t offset = totalBlocks * blockSize; // Calculate the offset for the remaining bytes
 
@@ -428,12 +441,12 @@ ECUServiceErrorCode ECUService_GMCAN::LoadKernel()
 
     if(remainingBytes > 0)
     {
-        const uint32_t loadAddress = _kernelLoadAddress + offset;
+        const uint32_t loadAddress = kernelLoadAddress + offset;
         cmdTransferData[2] = static_cast<uint8_t>(loadAddress >> 24);
         cmdTransferData[3] = static_cast<uint8_t>(loadAddress >> 16);
         cmdTransferData[4] = static_cast<uint8_t>(loadAddress >> 8);
         cmdTransferData[5] = static_cast<uint8_t>(loadAddress);
-        std::memcpy(cmdTransferData + 6, _kernelData + offset, remainingBytes);
+        std::memcpy(cmdTransferData + 6, kernelData + offset, remainingBytes);
         errorCode = SendAndWaitForResponse(cmdTransferData, remainingBytes + 6, transferDataResponseCondition);
         if(errorCode != ECU_SERVICE_ERROR_NONE) return errorCode; // Return if error occurred during transfer data request
     }
@@ -441,26 +454,26 @@ ECUServiceErrorCode ECUService_GMCAN::LoadKernel()
     for(uint32_t i = totalBlocks; i > 0; i--)
     {
         offset -= blockSize;
-        const uint32_t loadAddress = _kernelLoadAddress + offset;
+        const uint32_t loadAddress = kernelLoadAddress + offset;
         cmdTransferData[2] = static_cast<uint8_t>(loadAddress >> 24);
         cmdTransferData[3] = static_cast<uint8_t>(loadAddress >> 16);
         cmdTransferData[4] = static_cast<uint8_t>(loadAddress >> 8);
         cmdTransferData[5] = static_cast<uint8_t>(loadAddress);
-        std::memcpy(cmdTransferData + 6, _kernelData + offset, blockSize);
+        std::memcpy(cmdTransferData + 6, kernelData + offset, blockSize);
         errorCode = SendAndWaitForResponse(cmdTransferData, blockSize + 6, transferDataResponseCondition);
         if(errorCode != ECU_SERVICE_ERROR_NONE) return errorCode; // Return if error occurred during transfer data request
     }
 
-    if(_kernelRunAddress == 0x00)
+    if(kernelRunAddress == 0x00)
     {
         return errorCode; // Return if kernel run address is not set, no need to execute
     }
 
     cmdTransferData[1] = 0x80; // Set the second byte to 0x80 for execute
-    cmdTransferData[2] = static_cast<uint8_t>(_kernelRunAddress >> 24);
-    cmdTransferData[3] = static_cast<uint8_t>(_kernelRunAddress >> 16);
-    cmdTransferData[4] = static_cast<uint8_t>(_kernelRunAddress >> 8);
-    cmdTransferData[5] = static_cast<uint8_t>(_kernelRunAddress);
+    cmdTransferData[2] = static_cast<uint8_t>(kernelRunAddress >> 24);
+    cmdTransferData[3] = static_cast<uint8_t>(kernelRunAddress >> 16);
+    cmdTransferData[4] = static_cast<uint8_t>(kernelRunAddress >> 8);
+    cmdTransferData[5] = static_cast<uint8_t>(kernelRunAddress);
     errorCode = SendAndWaitForResponse(cmdTransferData, 6, [](const void *data, size_t length, ECUServiceErrorCode *errorCode) {
         const uint8_t *dataBytes = reinterpret_cast<const uint8_t *>(data);
         if(length < 1)
@@ -487,20 +500,78 @@ ECUServiceErrorCode ECUService_GMCAN::LoadKernel()
 
 ECUServiceErrorCode ECUService_GMCAN::ReadMemory(uint32_t address, uint8_t *buffer, uint32_t length)
 {
-    return ECU_SERVICE_ERROR_FUNCTION_UNDEFINED;
-}
+    if(length == 0)
+        return ECU_SERVICE_ERROR_NONE;
+    if(buffer == nullptr)
+        return ECU_SERVICE_ERROR_BAD_RESPONSE;
 
-ECUServiceErrorCode ECUService_GMCAN::EraseMemory(uint32_t address, uint32_t length)
-{
-    return ECU_SERVICE_ERROR_FUNCTION_UNDEFINED;
+    // The protocol only has a 16-bit length field, so split larger reads into
+    // consecutive requests while preserving the uint32_t API contract.
+    uint32_t offset = 0;
+    while(offset < length)
+    {
+        const uint32_t readAddress = address + offset;
+        const uint16_t readLength = static_cast<uint16_t>(std::min<uint32_t>(length - offset, 0xFFFF));
+        uint8_t cmdReadMemory[] = {
+            0x23,
+            static_cast<uint8_t>(readAddress >> 24),
+            static_cast<uint8_t>(readAddress >> 16),
+            static_cast<uint8_t>(readAddress >> 8),
+            static_cast<uint8_t>(readAddress),
+            static_cast<uint8_t>(readLength >> 8),
+            static_cast<uint8_t>(readLength)
+        };
+
+        ECUServiceErrorCode errorCode = SendAndWaitForResponse(
+            cmdReadMemory,
+            sizeof(cmdReadMemory),
+            [buffer, offset, readAddress, readLength](const void *data, size_t responseLength, ECUServiceErrorCode *errorCode) {
+                const uint8_t *dataBytes = reinterpret_cast<const uint8_t *>(data);
+                if(responseLength == 0)
+                    return false;
+
+                if(dataBytes[0] == 0x7F)
+                {
+                    if(responseLength < 3 || dataBytes[1] != 0x23)
+                        return false;
+                    if(dataBytes[2] == 0x78) // Response pending
+                        return false;
+                    *errorCode = ECU_SERVICE_ERROR_BAD_RESPONSE;
+                    return true;
+                }
+
+                if(dataBytes[0] != 0x63)
+                    return false;
+                if(responseLength != static_cast<size_t>(readLength) + 5)
+                {
+                    *errorCode = ECU_SERVICE_ERROR_BAD_RESPONSE;
+                    return true;
+                }
+
+                const uint32_t responseAddress =
+                    (static_cast<uint32_t>(dataBytes[1]) << 24) |
+                    (static_cast<uint32_t>(dataBytes[2]) << 16) |
+                    (static_cast<uint32_t>(dataBytes[3]) << 8) |
+                    static_cast<uint32_t>(dataBytes[4]);
+                if(responseAddress != readAddress)
+                {
+                    *errorCode = ECU_SERVICE_ERROR_BAD_RESPONSE;
+                    return true;
+                }
+
+                std::memcpy(buffer + offset, dataBytes + 5, readLength);
+                return true;
+            });
+
+        if(errorCode != ECU_SERVICE_ERROR_NONE)
+            return errorCode;
+        offset += readLength;
+    }
+
+    return ECU_SERVICE_ERROR_NONE;
 }
 
 ECUServiceErrorCode ECUService_GMCAN::WriteMemory(uint32_t address, const uint8_t *buffer, uint32_t length)
-{
-    return ECU_SERVICE_ERROR_FUNCTION_UNDEFINED;
-}
-
-ECUServiceErrorCode ECUService_GMCAN::VerifyMemory(uint32_t address, uint32_t length, uint32_t crc)
 {
     return ECU_SERVICE_ERROR_FUNCTION_UNDEFINED;
 }

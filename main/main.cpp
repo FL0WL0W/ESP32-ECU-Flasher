@@ -195,29 +195,83 @@ extern "C" void app_main(void)
         return length;
     });
 
+    static IECUService *ecuService = new ECUService_E92(_ecuISOTPService, [](uint32_t ms) { vTaskDelay(pdMS_TO_TICKS(ms)); });
+
+    const httpd_uri_t uploadKernelPost = {
+        .uri       = "/command/uploadKernel",
+        .method     = HTTP_POST,
+        .handler    = [ecuService](httpd_req_t *req) 
+        {
+            int total_len = req->content_len;
+            int cur_len = 0;
+            
+            // Allocate buffer for kernel data
+            uint8_t *kernel_data = (uint8_t *)malloc(total_len);
+            if (!kernel_data) {
+                ESP_LOGE("ECU", "Failed to allocate memory for kernel data");
+                httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Memory allocation failed");
+                return ESP_OK;
+            }
+            
+            // Read the POST body
+            while (cur_len < total_len) {
+                int recv_len = httpd_req_recv(req, (char *)kernel_data + cur_len, total_len - cur_len);
+                if (recv_len <= 0) {
+                    if (recv_len == HTTPD_SOCK_ERR_TIMEOUT) {
+                        ESP_LOGE("ECU", "Socket timeout while reading kernel data");
+                        httpd_resp_send_err(req, HTTPD_408_REQ_TIMEOUT, "Socket timeout");
+                        free(kernel_data);
+                        return ESP_OK;
+                    }
+                    break;
+                }
+                cur_len += recv_len;
+            }
+            
+            if (cur_len != total_len) {
+                ESP_LOGE("ECU", "Failed to read all kernel data: received %d/%d bytes", cur_len, total_len);
+                httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Incomplete kernel data");
+                free(kernel_data);
+                return ESP_OK;
+            }
+
+            ESP_LOGI("ECU", "Received kernel data (%d bytes)", total_len);
+
+            if(ecuService->UnlockECU() == ECU_SERVICE_ERROR_NONE) {
+                ESP_LOGI("ECU", "ECU unlocked successfully");
+            } else {
+                ESP_LOGE("ECU", "Failed to unlock ECU");
+                free(kernel_data);
+                httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to unlock ECU");
+                return ESP_OK;
+            }
+
+            if(ecuService->SuppressBroadcastMessages(true) == ECU_SERVICE_ERROR_NONE) {
+                ESP_LOGI("ECU", "Broadcast messages suppressed successfully");
+            } else {
+                ESP_LOGE("ECU", "Failed to suppress broadcast messages");
+                free(kernel_data);
+                httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to suppress broadcast messages");
+                return ESP_OK;
+            }
+
+            if(ecuService->LoadKernel(kernel_data, total_len) == ECU_SERVICE_ERROR_NONE) {
+                ESP_LOGI("ECU", "Kernel loaded successfully (%d bytes)", total_len);
+                httpd_resp_send(req, "OK", HTTPD_RESP_USE_STRLEN);
+            } else {
+                ESP_LOGE("ECU", "Failed to load kernel");
+                httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to load kernel");
+            }
+            
+            free(kernel_data);
+            return ESP_OK;
+        }
+    };
+    httpd_register_uri_handler(server, &uploadKernelPost);
+
     //do this last since it takes up all endpoints
     mount_mmrofs("/mm");
     register_file_handler_http_server("/mm");
-
-    IECUService *ecuService = new ECUService_E92(_ecuISOTPService, [](uint32_t ms) { vTaskDelay(pdMS_TO_TICKS(ms)); });
-
-    if(ecuService->UnlockECU() == ECU_SERVICE_ERROR_NONE) {
-        ESP_LOGI("ECU", "ECU unlocked successfully");
-    } else {
-        ESP_LOGE("ECU", "Failed to unlock ECU");
-    }
-
-    if(ecuService->SuppressBroadcastMessages(true) == ECU_SERVICE_ERROR_NONE) {
-        ESP_LOGI("ECU", "Broadcast messages suppressed successfully");
-    } else {
-        ESP_LOGE("ECU", "Failed to suppress broadcast messages");
-    }
-
-    if(ecuService->LoadKernel() == ECU_SERVICE_ERROR_NONE) {
-        ESP_LOGI("ECU", "Kernel loaded successfully");
-    } else {
-        ESP_LOGE("ECU", "Failed to load kernel");
-    }
 
     while(true)
     {

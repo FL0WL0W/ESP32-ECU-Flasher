@@ -26,11 +26,9 @@ class ECUService_GMCAN : public IECUService
         ECUServiceErrorCode IncreaseCommunicationSpeed() override;
         ECUServiceErrorCode DecreaseCommunicationSpeed() override;
         ECUServiceErrorCode UnlockECU() override;
-        ECUServiceErrorCode LoadKernel() override;
+        ECUServiceErrorCode LoadKernel(uint8_t *kernelData = 0, uint32_t kernelSize = 0, uint32_t kernelLoadAddress = 0, uint32_t kernelRunAddress = 0) override;
         ECUServiceErrorCode ReadMemory(uint32_t address, uint8_t *buffer, uint32_t length) override;
-        ECUServiceErrorCode EraseMemory(uint32_t address, uint32_t length) override;
         ECUServiceErrorCode WriteMemory(uint32_t address, const uint8_t *buffer, uint32_t length) override;
-        ECUServiceErrorCode VerifyMemory(uint32_t address, uint32_t length, uint32_t crc) override;
         ECUServiceErrorCode ResetECU() override;
 };
 
