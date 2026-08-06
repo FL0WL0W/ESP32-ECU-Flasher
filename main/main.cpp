@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <string.h>
+#include <algorithm>
 #include "esp_mac.h"
 #include "esp_wifi.h"
 #include "nvs_flash.h"
@@ -186,12 +187,12 @@ extern "C" void app_main(void)
     //setup link between socket and isotp service
     _ecuISOTPService->RegisterReceiveCallBack([_ecuWebSocketService](communication_send_callback_t send, const void *data, size_t length) {
         _ecuWebSocketService->Send(data, length);
-        ESP_LOGI("ISOTP", "Received %d bytes from ISOTP, sent to WebSocket, %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x", length, ((uint8_t*)data)[0], ((uint8_t*)data)[1], ((uint8_t*)data)[2], ((uint8_t*)data)[3], ((uint8_t*)data)[4], ((uint8_t*)data)[5], ((uint8_t*)data)[6], ((uint8_t*)data)[7], ((uint8_t*)data)[8], ((uint8_t*)data)[9], ((uint8_t*)data)[10], ((uint8_t*)data)[11], ((uint8_t*)data)[12], ((uint8_t*)data)[13], ((uint8_t*)data)[14], ((uint8_t*)data)[15], ((uint8_t*)data)[16], ((uint8_t*)data)[17], ((uint8_t*)data)[18], ((uint8_t*)data)[19], ((uint8_t*)data)[20]);
+        esp_log_buffer_hex("ISOTP", data, std::min(length, (size_t)20));
         return 0;
     });
     _ecuWebSocketService->RegisterReceiveCallBack([_ecuISOTPService](communication_send_callback_t send, const void *data, size_t length) {
         _ecuISOTPService->Send(data, length);
-        ESP_LOGI("WebSocket", "Received %d bytes from WebSocket, sent to ISOTP, %02x %02x %02x %02x", length, ((uint8_t*)data)[0], ((uint8_t*)data)[1], ((uint8_t*)data)[2], ((uint8_t*)data)[3]);
+        esp_log_buffer_hex("WebSocket", data, std::min(length, (size_t)20));
         return length;
     });
 
@@ -255,12 +256,26 @@ extern "C" void app_main(void)
                 return ESP_OK;
             }
 
-            if(ecuService->LoadKernel(kernel_data, total_len) == ECU_SERVICE_ERROR_NONE) {
-                ESP_LOGI("ECU", "Kernel loaded successfully (%d bytes)", total_len);
+            if(ecuService->EnableProgrammingMode() != ECU_SERVICE_ERROR_NONE) {
+                ESP_LOGE("ECU", "Failed to enable programming mode");
+                free(kernel_data);
+                httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to enable programming mode");
+                return ESP_OK;
+            }
+
+            if(ecuService->WriteMemory(0x40010000, kernel_data, total_len) != ECU_SERVICE_ERROR_NONE) {
+                ESP_LOGE("ECU", "Failed to write kernel to memory");
+                free(kernel_data);
+                httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to write kernel to memory");
+                return ESP_OK;
+            }
+
+            if(ecuService->ExecuteMemory(0x40010000) == ECU_SERVICE_ERROR_NONE) {
+                ESP_LOGI("ECU", "Kernel written and executed successfully (%d bytes)", total_len);
                 httpd_resp_send(req, "OK", HTTPD_RESP_USE_STRLEN);
             } else {
-                ESP_LOGE("ECU", "Failed to load kernel");
-                httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to load kernel");
+                ESP_LOGE("ECU", "Failed to execute kernel");
+                httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to execute kernel");
             }
             
             free(kernel_data);

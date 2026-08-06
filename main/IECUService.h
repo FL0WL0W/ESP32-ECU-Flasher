@@ -32,9 +32,10 @@ class IECUService
         virtual ECUServiceErrorCode IncreaseCommunicationSpeed();
         virtual ECUServiceErrorCode DecreaseCommunicationSpeed();
         virtual ECUServiceErrorCode UnlockECU();
-        virtual ECUServiceErrorCode LoadKernel(uint8_t *kernelData = 0, uint32_t kernelSize = 0, uint32_t kernelLoadAddress = 0, uint32_t kernelRunAddress = 0);
+        virtual ECUServiceErrorCode EnableProgrammingMode();
         virtual ECUServiceErrorCode ReadMemory(uint32_t address, uint8_t *buffer, uint32_t length);
         virtual ECUServiceErrorCode WriteMemory(uint32_t address, const uint8_t *buffer, uint32_t length);
+        virtual ECUServiceErrorCode ExecuteMemory(uint32_t address);
         virtual ECUServiceErrorCode ResetECU();
 };
 

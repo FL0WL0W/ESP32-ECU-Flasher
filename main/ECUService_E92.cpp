@@ -5,17 +5,9 @@
 
 using namespace EmbeddedIOServices;
 
-extern const uint8_t kernel_e92_start[] asm("_binary_Kernel_E92_bin_start");
-extern const uint8_t kernel_e92_end[]   asm("_binary_Kernel_E92_bin_end");
-
 ECUService_E92::ECUService_E92(ICommunicationService *ecuISOTPService, std::function<void(uint32_t)> delay)
     : ECUService_GMCAN(ecuISOTPService, delay)
 {
-    _kernelSize = kernel_e92_end - kernel_e92_start;
-    _kernelData = new uint8_t[_kernelSize];
-    std::memcpy(_kernelData, kernel_e92_start, _kernelSize);
-    _kernelLoadAddress = 0x40020000;
-    _kernelRunAddress = 0x40020000;
 }
 
 ECUService_E92::~ECUService_E92()
