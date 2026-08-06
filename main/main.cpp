@@ -203,46 +203,18 @@ extern "C" void app_main(void)
         .method     = HTTP_POST,
         .handler    = [ecuService](httpd_req_t *req) 
         {
-            int total_len = req->content_len;
-            int cur_len = 0;
-            
-            // Allocate buffer for kernel data
-            uint8_t *kernel_data = (uint8_t *)malloc(total_len);
-            if (!kernel_data) {
-                ESP_LOGE("ECU", "Failed to allocate memory for kernel data");
-                httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Memory allocation failed");
+            constexpr size_t kernelChunkSize = 2000;
+            constexpr uint32_t kernelLoadAddress = 0x40010000;
+            const int total_len = req->content_len;
+            if(total_len <= 0) {
+                httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Kernel data is empty");
                 return ESP_OK;
             }
-            
-            // Read the POST body
-            while (cur_len < total_len) {
-                int recv_len = httpd_req_recv(req, (char *)kernel_data + cur_len, total_len - cur_len);
-                if (recv_len <= 0) {
-                    if (recv_len == HTTPD_SOCK_ERR_TIMEOUT) {
-                        ESP_LOGE("ECU", "Socket timeout while reading kernel data");
-                        httpd_resp_send_err(req, HTTPD_408_REQ_TIMEOUT, "Socket timeout");
-                        free(kernel_data);
-                        return ESP_OK;
-                    }
-                    break;
-                }
-                cur_len += recv_len;
-            }
-            
-            if (cur_len != total_len) {
-                ESP_LOGE("ECU", "Failed to read all kernel data: received %d/%d bytes", cur_len, total_len);
-                httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Incomplete kernel data");
-                free(kernel_data);
-                return ESP_OK;
-            }
-
-            ESP_LOGI("ECU", "Received kernel data (%d bytes)", total_len);
 
             if(ecuService->UnlockECU() == ECU_SERVICE_ERROR_NONE) {
                 ESP_LOGI("ECU", "ECU unlocked successfully");
             } else {
                 ESP_LOGE("ECU", "Failed to unlock ECU");
-                free(kernel_data);
                 httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to unlock ECU");
                 return ESP_OK;
             }
@@ -251,33 +223,68 @@ extern "C" void app_main(void)
                 ESP_LOGI("ECU", "Broadcast messages suppressed successfully");
             } else {
                 ESP_LOGE("ECU", "Failed to suppress broadcast messages");
-                free(kernel_data);
                 httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to suppress broadcast messages");
                 return ESP_OK;
             }
 
             if(ecuService->EnableProgrammingMode() != ECU_SERVICE_ERROR_NONE) {
                 ESP_LOGE("ECU", "Failed to enable programming mode");
-                free(kernel_data);
                 httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to enable programming mode");
                 return ESP_OK;
             }
 
-            if(ecuService->WriteMemory(0x40010000, kernel_data, total_len) != ECU_SERVICE_ERROR_NONE) {
-                ESP_LOGE("ECU", "Failed to write kernel to memory");
-                free(kernel_data);
-                httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to write kernel to memory");
+            uint8_t *kernel_data = static_cast<uint8_t *>(malloc(kernelChunkSize));
+            if(kernel_data == nullptr) {
+                ESP_LOGE("ECU", "Failed to allocate kernel chunk buffer");
+                httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Memory allocation failed");
                 return ESP_OK;
             }
 
-            if(ecuService->ExecuteMemory(0x40010000) == ECU_SERVICE_ERROR_NONE) {
+            int received = 0;
+            while(received < total_len) {
+                const size_t bytesToRead = std::min(
+                    kernelChunkSize,
+                    static_cast<size_t>(total_len - received));
+                size_t chunkLength = 0;
+
+                while(chunkLength < bytesToRead) {
+                    const int recv_len = httpd_req_recv(
+                        req,
+                        reinterpret_cast<char *>(kernel_data) + chunkLength,
+                        bytesToRead - chunkLength);
+                    if(recv_len <= 0) {
+                        if(recv_len == HTTPD_SOCK_ERR_TIMEOUT) {
+                            ESP_LOGE("ECU", "Socket timeout while reading kernel data");
+                            httpd_resp_send_err(req, HTTPD_408_REQ_TIMEOUT, "Socket timeout");
+                        } else {
+                            ESP_LOGE("ECU", "Incomplete kernel data: received %d/%d bytes", received + static_cast<int>(chunkLength), total_len);
+                            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Incomplete kernel data");
+                        }
+                        free(kernel_data);
+                        return ESP_OK;
+                    }
+                    chunkLength += recv_len;
+                }
+
+                const uint32_t writeAddress = kernelLoadAddress + static_cast<uint32_t>(received);
+                if(ecuService->WriteMemory(writeAddress, kernel_data, chunkLength) != ECU_SERVICE_ERROR_NONE) {
+                    ESP_LOGE("ECU", "Failed to write kernel chunk at 0x%08lX", static_cast<unsigned long>(writeAddress));
+                    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to write kernel to memory");
+                    free(kernel_data);
+                    return ESP_OK;
+                }
+
+                received += static_cast<int>(chunkLength);
+                ESP_LOGI("ECU", "Wrote kernel bytes %d/%d", received, total_len);
+            }
+
+            if(ecuService->ExecuteMemory(kernelLoadAddress) == ECU_SERVICE_ERROR_NONE) {
                 ESP_LOGI("ECU", "Kernel written and executed successfully (%d bytes)", total_len);
                 httpd_resp_send(req, "OK", HTTPD_RESP_USE_STRLEN);
             } else {
                 ESP_LOGE("ECU", "Failed to execute kernel");
                 httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to execute kernel");
             }
-            
             free(kernel_data);
             return ESP_OK;
         }
