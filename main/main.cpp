@@ -1,6 +1,9 @@
 #include <stdio.h>
 #include <string.h>
 #include <algorithm>
+#include <cerrno>
+#include <cstdlib>
+#include <limits>
 #include "esp_mac.h"
 #include "esp_wifi.h"
 #include "nvs_flash.h"
@@ -17,6 +20,7 @@
 #include "mount.h"
 #include "ECUService_E92.h"
 #include "ECUService_E38.h"
+#include "UDS.h"
 
 using namespace EmbeddedIOServices;
 using namespace Esp32;
@@ -155,8 +159,6 @@ extern "C" void app_main(void)
     };
     httpd_register_uri_handler(server, &resetToOTAUpdaterPost);
 
-    _ecuWebSocketService = new Esp32IdfCommunicationService_WebSocket(server, "/ECUWebSocket");
-
     static Esp32IdfCANServiceChannelConfig canconfigs[2] 
     {
         {
@@ -186,17 +188,12 @@ extern "C" void app_main(void)
 
     //setup link between socket and isotp service
     _ecuISOTPService->RegisterReceiveCallBack([_ecuWebSocketService](communication_send_callback_t send, const void *data, size_t length) {
-        _ecuWebSocketService->Send(data, length);
         esp_log_buffer_hex("ISOTP", data, std::min(length, (size_t)20));
         return 0;
     });
-    _ecuWebSocketService->RegisterReceiveCallBack([_ecuISOTPService](communication_send_callback_t send, const void *data, size_t length) {
-        _ecuISOTPService->Send(data, length);
-        esp_log_buffer_hex("WebSocket", data, std::min(length, (size_t)20));
-        return length;
-    });
 
     static IECUService *ecuService = new ECUService_E92(_ecuISOTPService, [](uint32_t ms) { vTaskDelay(pdMS_TO_TICKS(ms)); });
+    static UDS *udsService = new UDS(_ecuISOTPService, [](uint32_t ms) { vTaskDelay(pdMS_TO_TICKS(ms)); });
 
     const httpd_uri_t uploadKernelPost = {
         .uri       = "/command/uploadKernel",
@@ -290,6 +287,318 @@ extern "C" void app_main(void)
         }
     };
     httpd_register_uri_handler(server, &uploadKernelPost);
+
+    const httpd_uri_t uploadECUPost = {
+        .uri       = "/command/uploadECU",
+        .method     = HTTP_POST,
+        .handler    = [udsService](httpd_req_t *req)
+        {
+            constexpr size_t receiveBufferSize = 4096;
+            char query[96];
+            char addressText[32];
+
+            if(httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK ||
+               httpd_query_key_value(query, "address", addressText, sizeof(addressText)) != ESP_OK)
+            {
+                httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "address query parameter is required");
+                return ESP_OK;
+            }
+
+            errno = 0;
+            char *addressEnd = nullptr;
+            const unsigned long long parsedAddress = strtoull(addressText, &addressEnd, 0);
+            const uint64_t lengthValue = static_cast<uint64_t>(req->content_len);
+            if(errno != 0 || addressEnd == addressText || *addressEnd != '\0' ||
+               parsedAddress > std::numeric_limits<uint32_t>::max() ||
+               req->content_len <= 0 ||
+               parsedAddress + lengthValue > (uint64_t{1} << 32))
+            {
+                httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid address or empty upload");
+                return ESP_OK;
+            }
+
+            UDSResponse downloadResponse = udsService->RequestDownload(parsedAddress, lengthValue);
+            if(!downloadResponse.Ok())
+            {
+                ESP_LOGE("UDS", "RequestDownload failed (status %u, NRC 0x%02X)",
+                         static_cast<unsigned>(downloadResponse.status),
+                         downloadResponse.negativeResponseCode);
+                httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "UDS RequestDownload failed");
+                return ESP_OK;
+            }
+
+            const bool compressedDownload = udsService->UsesLZ4Compression();
+            const size_t maximumBlockLength = udsService->MaximumBlockLength();
+            const size_t protocolOverhead = compressedDownload ? 4 : 2;
+            if(maximumBlockLength <= protocolOverhead)
+            {
+                udsService->RequestTransferExit();
+                httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Invalid UDS download block length");
+                return ESP_OK;
+            }
+
+            uint8_t *receiveBuffer = static_cast<uint8_t *>(malloc(receiveBufferSize));
+            if(receiveBuffer == nullptr)
+            {
+                udsService->RequestTransferExit();
+                httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Memory allocation failed");
+                return ESP_OK;
+            }
+
+            uint32_t uploaded = 0;
+            uint8_t blockSequenceCounter = 1;
+            while(uploaded < lengthValue)
+            {
+                const size_t bytesToRead = std::min<size_t>(receiveBufferSize, lengthValue - uploaded);
+                size_t received = 0;
+                while(received < bytesToRead)
+                {
+                    const int receiveLength = httpd_req_recv(
+                        req,
+                        reinterpret_cast<char *>(receiveBuffer) + received,
+                        bytesToRead - received);
+                    if(receiveLength <= 0)
+                    {
+                        udsService->RequestTransferExit();
+                        free(receiveBuffer);
+                        if(receiveLength == HTTPD_SOCK_ERR_TIMEOUT)
+                            httpd_resp_send_err(req, HTTPD_408_REQ_TIMEOUT, "Socket timeout");
+                        else
+                            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Incomplete upload");
+                        return ESP_OK;
+                    }
+                    received += static_cast<size_t>(receiveLength);
+                }
+
+                size_t bufferOffset = 0;
+                while(bufferOffset < received)
+                {
+                    size_t transferLength = compressedDownload
+                        ? received - bufferOffset
+                        : std::min(maximumBlockLength - protocolOverhead,
+                                   received - bufferOffset);
+                    UDSResponse transferResponse;
+
+                    while(true)
+                    {
+                        const std::vector<uint8_t> transferData(
+                            receiveBuffer + bufferOffset,
+                            receiveBuffer + bufferOffset + transferLength);
+                        transferResponse = udsService->TransferData(blockSequenceCounter, transferData);
+                        if(transferResponse.status != UDSStatus::CompressionError || transferLength == 1)
+                            break;
+                        transferLength /= 2;
+                    }
+
+                    if(!transferResponse.Ok() ||
+                       transferResponse.payload.empty() ||
+                       transferResponse.payload[0] != blockSequenceCounter)
+                    {
+                        ESP_LOGE("UDS", "TransferData block %u failed (status %u, NRC 0x%02X)",
+                                 blockSequenceCounter,
+                                 static_cast<unsigned>(transferResponse.status),
+                                 transferResponse.negativeResponseCode);
+                        udsService->RequestTransferExit();
+                        free(receiveBuffer);
+                        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "UDS TransferData failed");
+                        return ESP_OK;
+                    }
+
+                    bufferOffset += transferLength;
+                    uploaded += static_cast<uint32_t>(transferLength);
+                    ++blockSequenceCounter;
+                    if(uploaded == lengthValue || uploaded % (64 * 1024) < transferLength)
+                    {
+                        ESP_LOGI("ECU", "Uploaded %lu/%llu ECU bytes",
+                                 static_cast<unsigned long>(uploaded),
+                                 static_cast<unsigned long long>(lengthValue));
+                    }
+                }
+            }
+
+            free(receiveBuffer);
+            UDSResponse exitResponse = udsService->RequestTransferExit();
+            if(!exitResponse.Ok())
+            {
+                ESP_LOGE("UDS", "RequestTransferExit failed (status %u, NRC 0x%02X)",
+                         static_cast<unsigned>(exitResponse.status),
+                         exitResponse.negativeResponseCode);
+                httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "UDS RequestTransferExit failed");
+                return ESP_OK;
+            }
+
+            httpd_resp_send(req, "OK", HTTPD_RESP_USE_STRLEN);
+            return ESP_OK;
+        }
+    };
+    httpd_register_uri_handler(server, &uploadECUPost);
+
+    const httpd_uri_t downloadECUPost = {
+        .uri       = "/command/downloadECU",
+        .method     = HTTP_POST,
+        .handler    = [udsService](httpd_req_t *req)
+        {
+            constexpr uint64_t maximumUploadBlockLength = 8192;
+            char query[128];
+            char addressText[32];
+            char lengthText[32];
+
+            if(httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK ||
+               httpd_query_key_value(query, "address", addressText, sizeof(addressText)) != ESP_OK ||
+               httpd_query_key_value(query, "length", lengthText, sizeof(lengthText)) != ESP_OK)
+            {
+                httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "address and length query parameters are required");
+                return ESP_OK;
+            }
+
+            auto parseNumber = [](const char *text, uint64_t *value) {
+                if(text == nullptr || value == nullptr || text[0] == '\0')
+                    return false;
+                errno = 0;
+                char *end = nullptr;
+                const unsigned long long parsed = strtoull(text, &end, 0);
+                if(errno != 0 || end == text || *end != '\0')
+                    return false;
+                *value = parsed;
+                return true;
+            };
+
+            uint64_t addressValue = 0;
+            uint64_t lengthValue = 0;
+            if(!parseNumber(addressText, &addressValue) ||
+               !parseNumber(lengthText, &lengthValue) ||
+               addressValue > std::numeric_limits<uint32_t>::max() ||
+               lengthValue == 0 ||
+               lengthValue > std::numeric_limits<uint32_t>::max() ||
+               addressValue + lengthValue > (uint64_t{1} << 32))
+            {
+                httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid address or length");
+                return ESP_OK;
+            }
+
+            UDSResponse uploadResponse = udsService->RequestUpload(addressValue, lengthValue);
+            if(!uploadResponse.Ok())
+            {
+                ESP_LOGE("UDS", "RequestUpload failed (status %u, NRC 0x%02X)",
+                         static_cast<unsigned>(uploadResponse.status),
+                         uploadResponse.negativeResponseCode);
+                httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "UDS RequestUpload failed");
+                return ESP_OK;
+            }
+
+            if(uploadResponse.payload.empty())
+            {
+                httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Invalid UDS RequestUpload response");
+                return ESP_OK;
+            }
+
+            const uint8_t blockLengthBytes = uploadResponse.payload[0] >> 4;
+            if(blockLengthBytes == 0 ||
+               blockLengthBytes > 8 ||
+               uploadResponse.payload.size() < static_cast<size_t>(blockLengthBytes) + 1)
+            {
+                httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Invalid UDS upload block length");
+                return ESP_OK;
+            }
+
+            uint64_t maximumBlockLength = 0;
+            for(uint8_t i = 0; i < blockLengthBytes; ++i)
+                maximumBlockLength = (maximumBlockLength << 8) | uploadResponse.payload[i + 1];
+            if(maximumBlockLength <= 2 || maximumBlockLength > maximumUploadBlockLength)
+            {
+                ESP_LOGE("UDS", "Unsupported upload block length: %llu", static_cast<unsigned long long>(maximumBlockLength));
+                udsService->RequestTransferExit();
+                httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Unsupported UDS upload block length");
+                return ESP_OK;
+            }
+            const size_t maximumDataLength = static_cast<size_t>(maximumBlockLength - 2);
+            const bool compressedUpload = udsService->UsesLZ4Compression();
+
+            httpd_resp_set_type(req, "application/octet-stream");
+            httpd_resp_set_hdr(req, "Content-Disposition", "attachment; filename=ecu.bin");
+
+            uint32_t remaining = static_cast<uint32_t>(lengthValue);
+            uint32_t downloaded = 0;
+            uint8_t blockSequenceCounter = 1;
+            bool responseStarted = false;
+            while(remaining > 0)
+            {
+                UDSResponse transferResponse = udsService->TransferData(blockSequenceCounter);
+                if(!transferResponse.Ok())
+                {
+                    ESP_LOGE("UDS", "TransferData block %u failed (status %u, NRC 0x%02X)",
+                             blockSequenceCounter,
+                             static_cast<unsigned>(transferResponse.status),
+                             transferResponse.negativeResponseCode);
+                    udsService->RequestTransferExit();
+                    if(!responseStarted)
+                    {
+                        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "UDS TransferData failed");
+                        return ESP_OK;
+                    }
+                    return ESP_FAIL; // Close an already-started response so the client detects a truncated dump.
+                }
+
+                if(transferResponse.payload.size() < 2 || transferResponse.payload[0] != blockSequenceCounter)
+                {
+                    ESP_LOGE("UDS", "Invalid TransferData response for block %u", blockSequenceCounter);
+                    udsService->RequestTransferExit();
+                    if(!responseStarted)
+                    {
+                        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Invalid UDS TransferData response");
+                        return ESP_OK;
+                    }
+                    return ESP_FAIL;
+                }
+
+                const size_t chunkLength = transferResponse.payload.size() - 1;
+                const size_t maximumDecodedLength = compressedUpload ? 4096 : maximumDataLength;
+                if(chunkLength > maximumDecodedLength || chunkLength > remaining)
+                {
+                    ESP_LOGE("UDS", "Invalid TransferData payload length: %u", static_cast<unsigned>(chunkLength));
+                    udsService->RequestTransferExit();
+                    if(!responseStarted)
+                    {
+                        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Invalid UDS TransferData length");
+                        return ESP_OK;
+                    }
+                    return ESP_FAIL;
+                }
+
+                if(httpd_resp_send_chunk(req,
+                                         reinterpret_cast<const char *>(transferResponse.payload.data() + 1),
+                                         chunkLength) != ESP_OK)
+                {
+                    ESP_LOGE("ECU", "Failed to stream ECU data to HTTP client");
+                    udsService->RequestTransferExit();
+                    return ESP_FAIL;
+                }
+
+                responseStarted = true;
+                remaining -= static_cast<uint32_t>(chunkLength);
+                downloaded += static_cast<uint32_t>(chunkLength);
+                ++blockSequenceCounter;
+                if(remaining == 0 || downloaded % (64 * 1024) < chunkLength)
+                {
+                    ESP_LOGI("ECU", "Downloaded %lu/%llu ECU bytes",
+                             static_cast<unsigned long>(downloaded),
+                             static_cast<unsigned long long>(lengthValue));
+                }
+            }
+
+            UDSResponse exitResponse = udsService->RequestTransferExit();
+            if(!exitResponse.Ok())
+            {
+                ESP_LOGE("UDS", "RequestTransferExit failed (status %u, NRC 0x%02X)",
+                         static_cast<unsigned>(exitResponse.status),
+                         exitResponse.negativeResponseCode);
+            }
+            if(httpd_resp_send_chunk(req, nullptr, 0) != ESP_OK)
+                return ESP_FAIL;
+            return ESP_OK;
+        }
+    };
+    httpd_register_uri_handler(server, &downloadECUPost);
 
     //do this last since it takes up all endpoints
     mount_mmrofs("/mm");
