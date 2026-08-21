@@ -206,49 +206,63 @@ ECUServiceErrorCode ECUService_GMCAN::UnlockECU()
     uint8_t cmdRequestSeed[] = {0x27, 0x01};
     uint8_t seed[5] = {0}; // Buffer to hold the seed
     uint8_t seedLength = 0; // Variable to hold the seed length
-    errorCode = SendAndWaitForResponse(cmdRequestSeed, 2, [&seed, &seedLength](const void *data, size_t length, ECUServiceErrorCode *errorCode) {
-        const uint8_t *dataBytes = reinterpret_cast<const uint8_t *>(data);
-        if(length < 2)
-            return false;
-        if(dataBytes[0] == 0x67)
-        {
-            if(dataBytes[1] == 0x01) //response to seed request
+    uint8_t attempts = 0;
+    bool retry;
+    do
+    {
+        retry = false;
+        attempts++;
+        errorCode = SendAndWaitForResponse(cmdRequestSeed, 2, [&seed, &seedLength, &retry](const void *data, size_t length, ECUServiceErrorCode *errorCode) {
+            const uint8_t *dataBytes = reinterpret_cast<const uint8_t *>(data);
+            if(length < 2)
+                return false;
+            if(dataBytes[0] == 0x67)
             {
-                if(length < 4)
+                if(dataBytes[1] == 0x01) //response to seed request
                 {
+                    if(length < 4)
+                    {
+                        *errorCode = ECU_SERVICE_ERROR_BAD_RESPONSE; //bad response
+                        return true;
+                    }
+                    if(length == 4)
+                    {
+                        seed[0] = static_cast<uint32_t>(dataBytes[2]);
+                        seed[1] = static_cast<uint32_t>(dataBytes[3]);
+                        seedLength = 2;
+                        return true;
+                    }
+                    if(length == 7)
+                    {
+                        seed[0] = static_cast<uint32_t>(dataBytes[2]);
+                        seed[1] = static_cast<uint32_t>(dataBytes[3]);
+                        seed[2] = static_cast<uint32_t>(dataBytes[4]);
+                        seed[3] = static_cast<uint32_t>(dataBytes[5]);
+                        seed[4] = static_cast<uint32_t>(dataBytes[6]);
+                        seedLength = 5;
+                        return true;
+                    }
+                }
+            }
+            if(dataBytes[0] == 0x7F) //negative response to seed request
+            {
+                if(dataBytes[1] == 0x27)
+                {
+                    if(dataBytes[2] == 0x37) //security access denied
+                    {
+                        retry = true;
+                        return true;
+                    }
                     *errorCode = ECU_SERVICE_ERROR_BAD_RESPONSE; //bad response
                     return true;
                 }
-                if(length == 4)
-                {
-                    seed[0] = static_cast<uint32_t>(dataBytes[2]);
-                    seed[1] = static_cast<uint32_t>(dataBytes[3]);
-                    seedLength = 2;
-                    return true;
-                }
-                if(length == 7)
-                {
-                    seed[0] = static_cast<uint32_t>(dataBytes[2]);
-                    seed[1] = static_cast<uint32_t>(dataBytes[3]);
-                    seed[2] = static_cast<uint32_t>(dataBytes[4]);
-                    seed[3] = static_cast<uint32_t>(dataBytes[5]);
-                    seed[4] = static_cast<uint32_t>(dataBytes[6]);
-                    seedLength = 5;
-                    return true;
-                }
             }
-        }
-        if(dataBytes[0] == 0x7F) //negative response to seed request
-        {
-            if(dataBytes[1] == 0x27)
-            {
-                *errorCode = ECU_SERVICE_ERROR_BAD_RESPONSE; //bad response
-                return true;
-            }
-        }
-        return false; // Continue waiting for the response
-    });
-
+            return false; // Continue waiting for the response
+        });
+        if(retry) _delay(1000); // Wait for 1 second before retrying
+        /* code */
+    } while (retry == true && attempts < 10); // Retry up to 10 times
+    
     if(errorCode != ECU_SERVICE_ERROR_NONE) return errorCode; // Return if error occurred during seed request
     
     if(seed[0] == 0x00 && seed[1] == 0x00 && seed[2] == 0x00 && seed[3] == 0x00 && seed[4] == 0x00) //already unlocked, no need to send key

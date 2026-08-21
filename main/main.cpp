@@ -20,6 +20,8 @@
 #include "mount.h"
 #include "ECUService_E92.h"
 #include "ECUService_E38.h"
+#include "ECUService_E78.h"
+#include "ECUService_E78.h"
 #include "UDS.h"
 
 using namespace EmbeddedIOServices;
@@ -188,11 +190,11 @@ extern "C" void app_main(void)
 
     //setup link between socket and isotp service
     _ecuISOTPService->RegisterReceiveCallBack([_ecuWebSocketService](communication_send_callback_t send, const void *data, size_t length) {
-        esp_log_buffer_hex("ISOTP", data, std::min(length, (size_t)20));
+        esp_log_buffer_hex("ISOTP", data, std::min(length, (size_t)30));
         return 0;
     });
 
-    static IECUService *ecuService = new ECUService_E92(_ecuISOTPService, [](uint32_t ms) { vTaskDelay(pdMS_TO_TICKS(ms)); });
+    static IECUService *ecuService = new ECUService_E78(_ecuISOTPService, [](uint32_t ms) { vTaskDelay(pdMS_TO_TICKS(ms)); });
     static UDS *udsService = new UDS(_ecuISOTPService, [](uint32_t ms) { vTaskDelay(pdMS_TO_TICKS(ms)); });
 
     const httpd_uri_t uploadKernelPost = {
