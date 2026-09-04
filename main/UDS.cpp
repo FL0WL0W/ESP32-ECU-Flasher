@@ -14,6 +14,16 @@ constexpr uint8_t responsePending = 0x78;
 constexpr uint32_t pollIntervalMs = 1;
 constexpr uint8_t lz4DataFormatIdentifier = 0x10;
 constexpr size_t maximumLZ4BlockLength = 4096;
+constexpr uint16_t flashBlockMapRoutine = 0xFF00;
+constexpr uint16_t eraseFlashBlockRoutine = 0xFF01;
+
+uint32_t ReadBigEndian32(const uint8_t *data)
+{
+    return (static_cast<uint32_t>(data[0]) << 24) |
+           (static_cast<uint32_t>(data[1]) << 16) |
+           (static_cast<uint32_t>(data[2]) << 8) |
+           data[3];
+}
 }
 
 UDS::UDS(ICommunicationService *transport,
@@ -236,6 +246,151 @@ UDSResponse UDS::RoutineControl(uint8_t routineType, uint16_t routineIdentifier,
     AppendBigEndian(parameters, routineIdentifier, 2);
     parameters.insert(parameters.end(), optionRecord.begin(), optionRecord.end());
     return SubFunctionRequest(0x31, routineType, parameters, false);
+}
+
+UDSResponse UDS::GetFlashBlockMap(std::vector<UDSFlashBlock> &blocks)
+{
+    blocks.clear();
+    if(_transport == nullptr || !_delay)
+        return {UDSStatus::InvalidArgument};
+
+    constexpr size_t messageLength = 46;
+    constexpr size_t hashOffset = 14;
+    UDSResponse response;
+    std::atomic<bool> complete(false);
+    std::atomic<bool> activity(false);
+    size_t blockCount = 0;
+
+    const communication_receive_callback_id_t callbackId =
+        _transport->RegisterReceiveCallBack(
+            [&blocks, &blockCount, &response, &complete, &activity]
+            (communication_send_callback_t, const void *data, size_t length) -> size_t
+            {
+                if(complete.load(std::memory_order_acquire) || data == nullptr || length == 0)
+                    return 0;
+
+                const uint8_t *bytes = static_cast<const uint8_t *>(data);
+                if(bytes[0] == negativeResponseService && length >= 3 && bytes[1] == 0x31)
+                {
+                    if(bytes[2] == responsePending)
+                    {
+                        activity.store(true, std::memory_order_release);
+                    }
+                    else
+                    {
+                        response.status = UDSStatus::NegativeResponse;
+                        response.negativeResponseCode = bytes[2];
+                        complete.store(true, std::memory_order_release);
+                    }
+                    return 0;
+                }
+
+                if(bytes[0] != 0x71)
+                    return 0;
+                if(length != messageLength || bytes[1] != 0x01 ||
+                   bytes[2] != static_cast<uint8_t>(flashBlockMapRoutine >> 8) ||
+                   bytes[3] != static_cast<uint8_t>(flashBlockMapRoutine))
+                {
+                    response.status = UDSStatus::InvalidArgument;
+                    complete.store(true, std::memory_order_release);
+                    return 0;
+                }
+
+                const size_t reportedBlockCount = bytes[4];
+                const uint8_t blockId = bytes[5];
+                if(reportedBlockCount == 0 || blockId != blocks.size() ||
+                   (blockCount != 0 && reportedBlockCount != blockCount))
+                {
+                    response.status = UDSStatus::InvalidArgument;
+                    complete.store(true, std::memory_order_release);
+                    return 0;
+                }
+                if(blockCount == 0)
+                {
+                    blockCount = reportedBlockCount;
+                    blocks.reserve(blockCount);
+                }
+
+                UDSFlashBlock block;
+                block.id = blockId;
+                block.address = ReadBigEndian32(bytes + 6);
+                block.length = ReadBigEndian32(bytes + 10);
+                std::copy(bytes + hashOffset, bytes + messageLength, block.sha256.begin());
+                if(block.length == 0 ||
+                   static_cast<uint64_t>(block.address) + block.length > (uint64_t{1} << 32))
+                {
+                    response.status = UDSStatus::InvalidArgument;
+                    complete.store(true, std::memory_order_release);
+                    return 0;
+                }
+
+                blocks.push_back(block);
+                response.status = UDSStatus::Ok;
+                response.payload.assign(bytes + 1, bytes + length);
+                activity.store(true, std::memory_order_release);
+                if(blocks.size() == blockCount)
+                    complete.store(true, std::memory_order_release);
+                return 0;
+            });
+
+    uint32_t readyWaitMs = 0;
+    while(!_transport->Ready() && readyWaitMs < _responseTimeoutMs)
+    {
+        _delay(pollIntervalMs);
+        readyWaitMs += pollIntervalMs;
+    }
+    if(!_transport->Ready())
+    {
+        _transport->UnRegisterReceiveCallBack(callbackId);
+        return {UDSStatus::Timeout};
+    }
+
+    const uint8_t request[] = {0x31, 0x01, 0xFF, 0x00};
+    _transport->Send(request, sizeof(request));
+
+    uint32_t elapsedMs = 0;
+    uint32_t timeoutMs = _responseTimeoutMs;
+    while(!complete.load(std::memory_order_acquire))
+    {
+        _delay(pollIntervalMs);
+        ++elapsedMs;
+        if(activity.exchange(false, std::memory_order_acq_rel))
+        {
+            elapsedMs = 0;
+            timeoutMs = _responsePendingTimeoutMs;
+        }
+        if(elapsedMs >= timeoutMs)
+        {
+            response.status = UDSStatus::Timeout;
+            break;
+        }
+    }
+
+    _transport->UnRegisterReceiveCallBack(callbackId);
+    return response;
+}
+
+UDSResponse UDS::QueueEraseFlashBlock(uint8_t blockId)
+{
+    UDSResponse response = RoutineControl(0x01, eraseFlashBlockRoutine, {blockId});
+    if(!response.Ok())
+        return response;
+
+    // Positive response payload:
+    //   01 FF 01 <block-id> <queued/running/success/fail>
+    if(response.payload.size() != 5 ||
+       response.payload[0] != 0x01 ||
+       response.payload[1] != static_cast<uint8_t>(eraseFlashBlockRoutine >> 8) ||
+       response.payload[2] != static_cast<uint8_t>(eraseFlashBlockRoutine) ||
+       response.payload[3] != blockId)
+        return {UDSStatus::InvalidArgument};
+
+    const uint8_t eraseStatus = response.payload[4];
+    if(eraseStatus <= 2)
+        return response;
+    if(eraseStatus == 3)
+        return {UDSStatus::NegativeResponse, 0x72};
+    return {UDSStatus::InvalidArgument};
 }
 
 UDSResponse UDS::RequestDownload(uint64_t address, uint64_t size, uint8_t dataFormatIdentifier, uint8_t addressLength, uint8_t sizeLength)

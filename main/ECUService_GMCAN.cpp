@@ -351,7 +351,7 @@ ECUServiceErrorCode ECUService_GMCAN::EnableProgrammingMode()
         return false; // Continue waiting for the response
     });
 
-    if(errorCode != ECU_SERVICE_ERROR_NONE) return errorCode; // Return if error occurred during prepare programming request
+    if(errorCode != ECU_SERVICE_ERROR_NONE && errorCode != ECU_SERVICE_ERROR_TIMEOUT) return errorCode; // Return if error occurred during prepare programming request unless timeout since this may or may not respond
 
     uint8_t cmdCommitProgramming[] = {0xA5, 0x03};
     errorCode = SendAndWaitForResponse(cmdCommitProgramming, 2, [](const void *data, size_t length, ECUServiceErrorCode *errorCode) {

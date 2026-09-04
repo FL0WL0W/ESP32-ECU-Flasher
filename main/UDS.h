@@ -5,6 +5,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <array>
 #include <functional>
 #include <vector>
 
@@ -24,6 +25,14 @@ struct UDSResponse
     std::vector<uint8_t> payload;
 
     bool Ok() const { return status == UDSStatus::Ok; }
+};
+
+struct UDSFlashBlock
+{
+    uint8_t id = 0;
+    uint32_t address = 0;
+    uint32_t length = 0;
+    std::array<uint8_t, 32> sha256{};
 };
 
 class UDS
@@ -64,6 +73,8 @@ class UDS
         UDSResponse WriteDataByIdentifier(uint16_t identifier, const std::vector<uint8_t> &data);
         UDSResponse InputOutputControlByIdentifier(uint16_t identifier, uint8_t controlParameter, const std::vector<uint8_t> &controlState = {});
         UDSResponse RoutineControl(uint8_t routineType, uint16_t routineIdentifier, const std::vector<uint8_t> &optionRecord = {});
+        UDSResponse GetFlashBlockMap(std::vector<UDSFlashBlock> &blocks);
+        UDSResponse QueueEraseFlashBlock(uint8_t blockId);
         UDSResponse RequestDownload(uint64_t address, uint64_t size, uint8_t dataFormatIdentifier = 0x10, uint8_t addressLength = 4, uint8_t sizeLength = 4);
         UDSResponse RequestUpload(uint64_t address, uint64_t size, uint8_t dataFormatIdentifier = 0x10, uint8_t addressLength = 4, uint8_t sizeLength = 4);
         UDSResponse TransferData(uint8_t blockSequenceCounter, const std::vector<uint8_t> &data = {});

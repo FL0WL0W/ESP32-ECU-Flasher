@@ -17,6 +17,7 @@
 #include "http_server.h"
 #include "esp_ota_ops.h"
 #include "esp_log.h"
+#include "mbedtls/sha256.h"
 #include "mount.h"
 #include "ECUService_E92.h"
 #include "ECUService_E38.h"
@@ -99,6 +100,12 @@ ICANService *_canService;
 Esp32IdfCANService *_esp32CANService;
 ICommunicationService *_ecuISOTPService;
 ICommunicationService *_ecuWebSocketService;
+
+namespace
+{
+constexpr size_t ecuFlashStagingBufferSize = 128U * 1024U;
+uint8_t *ecuFlashStagingBuffer = nullptr;
+}
 
 extern "C" void app_main(void)
 {
@@ -190,12 +197,20 @@ extern "C" void app_main(void)
 
     //setup link between socket and isotp service
     _ecuISOTPService->RegisterReceiveCallBack([_ecuWebSocketService](communication_send_callback_t send, const void *data, size_t length) {
-        esp_log_buffer_hex("ISOTP", data, std::min(length, (size_t)30));
+        esp_log_buffer_hex("ISOTP", data, std::min(length, (size_t)64));
         return 0;
     });
 
     static IECUService *ecuService = new ECUService_E78(_ecuISOTPService, [](uint32_t ms) { vTaskDelay(pdMS_TO_TICKS(ms)); });
     static UDS *udsService = new UDS(_ecuISOTPService, [](uint32_t ms) { vTaskDelay(pdMS_TO_TICKS(ms)); });
+
+    // Reserve the largest MPC5566 physical flash block once the long-lived
+    // services exist, but before any upload can fragment the heap. Reuse it
+    // for every flash block and every subsequent upload.
+    ecuFlashStagingBuffer = static_cast<uint8_t *>(malloc(ecuFlashStagingBufferSize));
+    if(ecuFlashStagingBuffer == nullptr)
+        ESP_LOGE("ECU", "Unable to allocate the %u-byte flash staging buffer",
+                 static_cast<unsigned>(ecuFlashStagingBufferSize));
 
     const httpd_uri_t uploadKernelPost = {
         .uri       = "/command/uploadKernel",
@@ -203,7 +218,7 @@ extern "C" void app_main(void)
         .handler    = [ecuService](httpd_req_t *req) 
         {
             constexpr size_t kernelChunkSize = 2000;
-            constexpr uint32_t kernelLoadAddress = 0x40010000;
+            constexpr uint32_t kernelLoadAddress = 0x40014000;
             const int total_len = req->content_len;
             if(total_len <= 0) {
                 httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Kernel data is empty");
@@ -221,10 +236,7 @@ extern "C" void app_main(void)
             if(ecuService->SuppressBroadcastMessages(true) == ECU_SERVICE_ERROR_NONE) {
                 ESP_LOGI("ECU", "Broadcast messages suppressed successfully");
             } else {
-                ESP_LOGE("ECU", "Failed to suppress broadcast messages");
-                httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to suppress broadcast messages");
-                return ESP_OK;
-            }
+                ESP_LOGE("ECU", "Failed to suppress broadcast messages");            }
 
             if(ecuService->EnableProgrammingMode() != ECU_SERVICE_ERROR_NONE) {
                 ESP_LOGE("ECU", "Failed to enable programming mode");
@@ -295,7 +307,6 @@ extern "C" void app_main(void)
         .method     = HTTP_POST,
         .handler    = [udsService](httpd_req_t *req)
         {
-            constexpr size_t receiveBufferSize = 4096;
             char query[96];
             char addressText[32];
 
@@ -319,50 +330,67 @@ extern "C" void app_main(void)
                 return ESP_OK;
             }
 
-            UDSResponse downloadResponse = udsService->RequestDownload(parsedAddress, lengthValue);
-            if(!downloadResponse.Ok())
+            std::vector<UDSFlashBlock> flashBlocks;
+            UDSResponse mapResponse = udsService->GetFlashBlockMap(flashBlocks);
+            if(!mapResponse.Ok())
             {
-                ESP_LOGE("UDS", "RequestDownload failed (status %u, NRC 0x%02X)",
-                         static_cast<unsigned>(downloadResponse.status),
-                         downloadResponse.negativeResponseCode);
-                httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "UDS RequestDownload failed");
+                ESP_LOGE("UDS", "Flash block map failed (status %u, NRC 0x%02X)",
+                         static_cast<unsigned>(mapResponse.status),
+                         mapResponse.negativeResponseCode);
+                httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Unable to read flash block map");
                 return ESP_OK;
             }
 
-            const bool compressedDownload = udsService->UsesLZ4Compression();
-            const size_t maximumBlockLength = udsService->MaximumBlockLength();
-            const size_t protocolOverhead = compressedDownload ? 4 : 2;
-            if(maximumBlockLength <= protocolOverhead)
+            std::vector<UDSFlashBlock> uploadBlocks;
+            uint64_t expectedAddress = parsedAddress;
+            uint64_t remainingUpload = lengthValue;
+            for(const UDSFlashBlock &block : flashBlocks)
             {
-                udsService->RequestTransferExit();
-                httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Invalid UDS download block length");
+                if(block.address != expectedAddress)
+                    continue;
+                if(block.length > remainingUpload)
+                    break;
+                uploadBlocks.push_back(block);
+                expectedAddress += block.length;
+                remainingUpload -= block.length;
+                if(remainingUpload == 0)
+                    break;
+            }
+            if(uploadBlocks.empty() || remainingUpload != 0)
+            {
+                httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                                    "Upload must contain complete physical flash blocks");
                 return ESP_OK;
             }
 
-            uint8_t *receiveBuffer = static_cast<uint8_t *>(malloc(receiveBufferSize));
-            if(receiveBuffer == nullptr)
+            if(ecuFlashStagingBuffer == nullptr)
             {
-                udsService->RequestTransferExit();
-                httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Memory allocation failed");
+                httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                                    "Flash staging buffer is unavailable");
                 return ESP_OK;
             }
 
-            uint32_t uploaded = 0;
-            uint8_t blockSequenceCounter = 1;
-            while(uploaded < lengthValue)
+            uint64_t uploaded = 0;
+            for(const UDSFlashBlock &block : uploadBlocks)
             {
-                const size_t bytesToRead = std::min<size_t>(receiveBufferSize, lengthValue - uploaded);
+                if(block.length > ecuFlashStagingBufferSize)
+                {
+                    ESP_LOGE("ECU", "Flash block %u is too large: %lu bytes",
+                             block.id, static_cast<unsigned long>(block.length));
+                    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                                        "Flash block exceeds staging buffer");
+                    return ESP_OK;
+                }
+
                 size_t received = 0;
-                while(received < bytesToRead)
+                while(received < block.length)
                 {
                     const int receiveLength = httpd_req_recv(
                         req,
-                        reinterpret_cast<char *>(receiveBuffer) + received,
-                        bytesToRead - received);
+                        reinterpret_cast<char *>(ecuFlashStagingBuffer + received),
+                        block.length - received);
                     if(receiveLength <= 0)
                     {
-                        udsService->RequestTransferExit();
-                        free(receiveBuffer);
                         if(receiveLength == HTTPD_SOCK_ERR_TIMEOUT)
                             httpd_resp_send_err(req, HTTPD_408_REQ_TIMEOUT, "Socket timeout");
                         else
@@ -372,61 +400,141 @@ extern "C" void app_main(void)
                     received += static_cast<size_t>(receiveLength);
                 }
 
-                size_t bufferOffset = 0;
-                while(bufferOffset < received)
+                std::array<uint8_t, 32> uploadedHash{};
+                if(mbedtls_sha256(ecuFlashStagingBuffer, block.length,
+                                  uploadedHash.data(), 0) != 0)
                 {
-                    size_t transferLength = compressedDownload
-                        ? received - bufferOffset
-                        : std::min(maximumBlockLength - protocolOverhead,
-                                   received - bufferOffset);
-                    UDSResponse transferResponse;
+                    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "SHA-256 failed");
+                    return ESP_OK;
+                }
 
-                    while(true)
-                    {
-                        const std::vector<uint8_t> transferData(
-                            receiveBuffer + bufferOffset,
-                            receiveBuffer + bufferOffset + transferLength);
-                        transferResponse = udsService->TransferData(blockSequenceCounter, transferData);
-                        if(transferResponse.status != UDSStatus::CompressionError || transferLength == 1)
-                            break;
-                        transferLength /= 2;
-                    }
+                uploaded += block.length;
+                if(uploadedHash == block.sha256)
+                {
+                    ESP_LOGI("ECU", "Block %u at 0x%08lX unchanged (%llu/%llu bytes)",
+                             block.id,
+                             static_cast<unsigned long>(block.address),
+                             static_cast<unsigned long long>(uploaded),
+                             static_cast<unsigned long long>(lengthValue));
+                    continue;
+                }
 
-                    if(!transferResponse.Ok() ||
-                       transferResponse.payload.empty() ||
-                       transferResponse.payload[0] != blockSequenceCounter)
+                ESP_LOGI("ECU", "Queueing erase for changed block %u at 0x%08lX", block.id,
+                         static_cast<unsigned long>(block.address));
+                UDSResponse eraseResponse = udsService->QueueEraseFlashBlock(block.id);
+                if(!eraseResponse.Ok())
+                {
+                    ESP_LOGE("UDS", "Erase block %u failed (status %u, NRC 0x%02X)",
+                             block.id,
+                             static_cast<unsigned>(eraseResponse.status),
+                             eraseResponse.negativeResponseCode);
+                    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Flash erase failed");
+                    return ESP_OK;
+                }
+
+                UDSResponse downloadResponse =
+                    udsService->RequestDownload(block.address, block.length);
+                if(!downloadResponse.Ok())
+                {
+                    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "UDS RequestDownload failed");
+                    return ESP_OK;
+                }
+
+                const bool compressed = udsService->UsesLZ4Compression();
+                const size_t maximumMessageLength = udsService->MaximumBlockLength();
+                const size_t overhead = compressed ? 4U : 2U;
+                if(maximumMessageLength <= overhead)
+                {
+                    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Invalid download block length");
+                    return ESP_OK;
+                }
+
+				size_t blockOffset = 0;
+				uint8_t sequenceCounter = 1;
+				while(blockOffset < block.length)
+				{
+                    size_t transferLength = compressed
+                        ? std::min<size_t>(4096U, block.length - blockOffset)
+                        : std::min<size_t>(maximumMessageLength - overhead,
+                                           block.length - blockOffset);
+                    transferLength &= ~size_t{7};
+                    if(transferLength == 0)
                     {
-                        ESP_LOGE("UDS", "TransferData block %u failed (status %u, NRC 0x%02X)",
-                                 blockSequenceCounter,
-                                 static_cast<unsigned>(transferResponse.status),
-                                 transferResponse.negativeResponseCode);
-                        udsService->RequestTransferExit();
-                        free(receiveBuffer);
-                        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "UDS TransferData failed");
+                        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Unaligned flash transfer");
                         return ESP_OK;
                     }
 
-                    bufferOffset += transferLength;
-                    uploaded += static_cast<uint32_t>(transferLength);
-                    ++blockSequenceCounter;
-                    if(uploaded == lengthValue || uploaded % (64 * 1024) < transferLength)
+					UDSResponse transferResponse;
+					unsigned timeoutRetries = 0;
+					while(true)
+					{
+                        const std::vector<uint8_t> transferData(
+                            ecuFlashStagingBuffer + blockOffset,
+                            ecuFlashStagingBuffer + blockOffset + transferLength);
+                        transferResponse = udsService->TransferData(sequenceCounter, transferData);
+                        if(transferResponse.status == UDSStatus::CompressionError &&
+                           transferLength > 8U)
+                        {
+                            transferLength = (transferLength / 2U) & ~size_t{7};
+                            continue;
+                        }
+						if(transferResponse.status == UDSStatus::NegativeResponse &&
+						   transferResponse.negativeResponseCode == 0x21)
+						{
+							vTaskDelay(pdMS_TO_TICKS(1));
+							continue;
+						}
+						// A queued write and its acknowledgment are idempotent for a
+						// repeated block sequence counter. Retry a dropped response,
+						// but remain bounded if the ECU has actually stopped running.
+						if(transferResponse.status == UDSStatus::Timeout &&
+						   timeoutRetries < 3U)
+						{
+							++timeoutRetries;
+							vTaskDelay(pdMS_TO_TICKS(5));
+							continue;
+						}
+						break;
+					}
+                    if(!transferResponse.Ok() || transferResponse.payload.empty() ||
+                       transferResponse.payload[0] != sequenceCounter)
                     {
-                        ESP_LOGI("ECU", "Uploaded %lu/%llu ECU bytes",
-                                 static_cast<unsigned long>(uploaded),
-                                 static_cast<unsigned long long>(lengthValue));
+                        ESP_LOGE("UDS", "TransferData 0x%02X failed (status %u, NRC 0x%02X)",
+                                 sequenceCounter,
+                                 static_cast<unsigned>(transferResponse.status),
+                                 transferResponse.negativeResponseCode);
+                        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "UDS TransferData failed");
+                        return ESP_OK;
                     }
+                    blockOffset += transferLength;
+                    ++sequenceCounter;
                 }
-            }
 
-            free(receiveBuffer);
-            UDSResponse exitResponse = udsService->RequestTransferExit();
-            if(!exitResponse.Ok())
-            {
-                ESP_LOGE("UDS", "RequestTransferExit failed (status %u, NRC 0x%02X)",
-                         static_cast<unsigned>(exitResponse.status),
-                         exitResponse.negativeResponseCode);
-                httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "UDS RequestTransferExit failed");
-                return ESP_OK;
+                UDSResponse exitResponse;
+                do
+                {
+                    exitResponse = udsService->RequestTransferExit();
+                    if(exitResponse.status == UDSStatus::NegativeResponse &&
+                       exitResponse.negativeResponseCode == 0x21)
+                        vTaskDelay(pdMS_TO_TICKS(1));
+                    else
+                        break;
+                } while(true);
+                if(!exitResponse.Ok())
+                {
+                    ESP_LOGE("UDS", "Block %u transfer exit failed (status %u, NRC 0x%02X)",
+                             block.id,
+                             static_cast<unsigned>(exitResponse.status),
+                             exitResponse.negativeResponseCode);
+                    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Flash programming failed");
+                    return ESP_OK;
+                }
+
+                ESP_LOGI("ECU", "Programmed block %u at 0x%08lX (%llu/%llu bytes)",
+                         block.id,
+                         static_cast<unsigned long>(block.address),
+                         static_cast<unsigned long long>(uploaded),
+                         static_cast<unsigned long long>(lengthValue));
             }
 
             httpd_resp_send(req, "OK", HTTPD_RESP_USE_STRLEN);
