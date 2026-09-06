@@ -54,11 +54,7 @@ ECUServiceErrorCode ECUService_E78::SeedKeyAlgorithm(uint8_t *key, const uint8_t
         mbedtls_aes_crypt_ecb(&aes, MBEDTLS_AES_ENCRYPT, block, ciphertext);
         mbedtls_aes_free(&aes);
 
-        key[0] = ciphertext[0];
-        key[1] = ciphertext[1];
-        key[2] = ciphertext[2];
-        key[3] = ciphertext[3];
-        key[4] = ciphertext[4];
+        memcpy(key, ciphertext, 5);
     }
     else
     {
