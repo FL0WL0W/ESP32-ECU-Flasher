@@ -78,6 +78,9 @@ class UDS
         UDSResponse RequestDownload(uint64_t address, uint64_t size, uint8_t dataFormatIdentifier = 0x10, uint8_t addressLength = 4, uint8_t sizeLength = 4);
         UDSResponse RequestUpload(uint64_t address, uint64_t size, uint8_t dataFormatIdentifier = 0x10, uint8_t addressLength = 4, uint8_t sizeLength = 4);
         UDSResponse TransferData(uint8_t blockSequenceCounter, const std::vector<uint8_t> &data = {});
+        UDSResponse TransferData(uint8_t blockSequenceCounter,
+                                 const uint8_t *data,
+                                 size_t dataLength);
         UDSResponse RequestTransferExit(const std::vector<uint8_t> &parameters = {});
         UDSResponse RequestFileTransfer(uint8_t modeOfOperation, const std::vector<uint8_t> &parameters);
         UDSResponse WriteMemoryByAddress(uint64_t address, const std::vector<uint8_t> &data, uint8_t addressLength = 4, uint8_t sizeLength = 4);
@@ -101,6 +104,10 @@ class UDS
                                     uint8_t sizeLength) const;
         static void AppendBigEndian(std::vector<uint8_t> &target, uint64_t value, uint8_t length);
         static size_t ParseMaximumBlockLength(const UDSResponse &response);
+        UDSResponse RequestPrepared(uint8_t service,
+                                    const uint8_t *request,
+                                    size_t requestLength,
+                                    bool expectResponse);
         UDSResponse SubFunctionRequest(uint8_t service,
                                        uint8_t subFunction,
                                        const std::vector<uint8_t> &parameters,

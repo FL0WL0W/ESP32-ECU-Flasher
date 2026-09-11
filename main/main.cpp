@@ -104,7 +104,9 @@ ICommunicationService *_ecuWebSocketService;
 namespace
 {
 constexpr size_t ecuFlashStagingBufferSize = 128U * 1024U;
-uint8_t *ecuFlashStagingBuffer = nullptr;
+constexpr size_t ecuTransferBufferSize = 4096U;
+std::array<uint8_t, ecuFlashStagingBufferSize> ecuFlashStagingBuffer{};
+std::array<uint8_t, ecuTransferBufferSize> ecuTransferBuffer{};
 }
 
 extern "C" void app_main(void)
@@ -201,16 +203,8 @@ extern "C" void app_main(void)
         return 0;
     });
 
-    static IECUService *ecuService = new ECUService_E78(_ecuISOTPService, [](uint32_t ms) { vTaskDelay(pdMS_TO_TICKS(ms)); });
+    static IECUService *ecuService = new ECUService_E92(_ecuISOTPService, [](uint32_t ms) { vTaskDelay(pdMS_TO_TICKS(ms)); });
     static UDS *udsService = new UDS(_ecuISOTPService, [](uint32_t ms) { vTaskDelay(pdMS_TO_TICKS(ms)); });
-
-    // Reserve the largest MPC5566 physical flash block once the long-lived
-    // services exist, but before any upload can fragment the heap. Reuse it
-    // for every flash block and every subsequent upload.
-    ecuFlashStagingBuffer = static_cast<uint8_t *>(malloc(ecuFlashStagingBufferSize));
-    if(ecuFlashStagingBuffer == nullptr)
-        ESP_LOGE("ECU", "Unable to allocate the %u-byte flash staging buffer",
-                 static_cast<unsigned>(ecuFlashStagingBufferSize));
 
     const httpd_uri_t uploadKernelPost = {
         .uri       = "/command/uploadKernel",
@@ -218,7 +212,7 @@ extern "C" void app_main(void)
         .handler    = [ecuService](httpd_req_t *req) 
         {
             constexpr size_t kernelChunkSize = 2000;
-            constexpr uint32_t kernelLoadAddress = 0x40014000;
+            constexpr uint32_t kernelLoadAddress = 0x40010000;
             const int total_len = req->content_len;
             if(total_len <= 0) {
                 httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Kernel data is empty");
@@ -240,8 +234,8 @@ extern "C" void app_main(void)
 
             if(ecuService->EnableProgrammingMode() != ECU_SERVICE_ERROR_NONE) {
                 ESP_LOGE("ECU", "Failed to enable programming mode");
-                httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to enable programming mode");
-                return ESP_OK;
+                // httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to enable programming mode");
+                // return ESP_OK;
             }
 
             uint8_t *kernel_data = static_cast<uint8_t *>(malloc(kernelChunkSize));
@@ -363,60 +357,48 @@ extern "C" void app_main(void)
                 return ESP_OK;
             }
 
-            if(ecuFlashStagingBuffer == nullptr)
-            {
-                httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
-                                    "Flash staging buffer is unavailable");
-                return ESP_OK;
-            }
-
             uint64_t uploaded = 0;
             for(const UDSFlashBlock &block : uploadBlocks)
             {
-                if(block.length > ecuFlashStagingBufferSize)
+                const bool blockBuffered = block.length <= ecuFlashStagingBufferSize;
+                if(blockBuffered)
                 {
-                    ESP_LOGE("ECU", "Flash block %u is too large: %lu bytes",
-                             block.id, static_cast<unsigned long>(block.length));
-                    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
-                                        "Flash block exceeds staging buffer");
-                    return ESP_OK;
-                }
-
-                size_t received = 0;
-                while(received < block.length)
-                {
-                    const int receiveLength = httpd_req_recv(
-                        req,
-                        reinterpret_cast<char *>(ecuFlashStagingBuffer + received),
-                        block.length - received);
-                    if(receiveLength <= 0)
+                    size_t received = 0;
+                    while(received < block.length)
                     {
-                        if(receiveLength == HTTPD_SOCK_ERR_TIMEOUT)
-                            httpd_resp_send_err(req, HTTPD_408_REQ_TIMEOUT, "Socket timeout");
-                        else
-                            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Incomplete upload");
+                        const int receiveLength = httpd_req_recv(
+                            req,
+                            reinterpret_cast<char *>(ecuFlashStagingBuffer.data() + received),
+                            block.length - received);
+                        if(receiveLength <= 0)
+                        {
+                            if(receiveLength == HTTPD_SOCK_ERR_TIMEOUT)
+                                httpd_resp_send_err(req, HTTPD_408_REQ_TIMEOUT, "Socket timeout");
+                            else
+                                httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Incomplete upload");
+                            return ESP_OK;
+                        }
+                        received += static_cast<size_t>(receiveLength);
+                    }
+
+                    std::array<uint8_t, 32> uploadedHash{};
+                    if(mbedtls_sha256(ecuFlashStagingBuffer.data(), block.length,
+                                    uploadedHash.data(), 0) != 0)
+                    {
+                        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "SHA-256 failed");
                         return ESP_OK;
                     }
-                    received += static_cast<size_t>(receiveLength);
-                }
 
-                std::array<uint8_t, 32> uploadedHash{};
-                if(mbedtls_sha256(ecuFlashStagingBuffer, block.length,
-                                  uploadedHash.data(), 0) != 0)
-                {
-                    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "SHA-256 failed");
-                    return ESP_OK;
-                }
-
-                uploaded += block.length;
-                if(uploadedHash == block.sha256)
-                {
-                    ESP_LOGI("ECU", "Block %u at 0x%08lX unchanged (%llu/%llu bytes)",
-                             block.id,
-                             static_cast<unsigned long>(block.address),
-                             static_cast<unsigned long long>(uploaded),
-                             static_cast<unsigned long long>(lengthValue));
-                    continue;
+                    uploaded += block.length;
+                    if(uploadedHash == block.sha256)
+                    {
+                        ESP_LOGI("ECU", "Block %u at 0x%08lX unchanged (%llu/%llu bytes)",
+                                block.id,
+                                static_cast<unsigned long>(block.address),
+                                static_cast<unsigned long long>(uploaded),
+                                static_cast<unsigned long long>(lengthValue));
+                        continue;
+                    }
                 }
 
                 ESP_LOGI("ECU", "Queueing erase for changed block %u at 0x%08lX", block.id,
@@ -453,10 +435,25 @@ extern "C" void app_main(void)
 				uint8_t sequenceCounter = 1;
 				while(blockOffset < block.length)
 				{
+                    const size_t compressedCapacity = maximumMessageLength - overhead;
                     size_t transferLength = compressed
-                        ? std::min<size_t>(4096U, block.length - blockOffset)
-                        : std::min<size_t>(maximumMessageLength - overhead,
-                                           block.length - blockOffset);
+                        ? std::min<size_t>(ecuTransferBuffer.size(),
+                                           block.length - blockOffset)
+                        : std::min({compressedCapacity,
+                                    ecuTransferBuffer.size(),
+                                    static_cast<size_t>(block.length - blockOffset)});
+
+                    // A raw LZ4 block can grow slightly for incompressible data.
+                    // Choose a size whose standard compress-bound fits the UDS
+                    // payload so a streamed HTTP chunk never has to be split after
+                    // it has already been consumed from the socket.
+                    if(compressed)
+                    {
+                        while(transferLength != 0U &&
+                              transferLength + transferLength / 255U + 16U >
+                                  compressedCapacity)
+                            transferLength -= 8U;
+                    }
                     transferLength &= ~size_t{7};
                     if(transferLength == 0)
                     {
@@ -464,20 +461,45 @@ extern "C" void app_main(void)
                         return ESP_OK;
                     }
 
+                    // Read or copy this sequence exactly once. Queue-busy and
+                    // timeout retries below must resend these same bytes; reading
+                    // from the HTTP socket again would silently discard firmware.
+                    if(blockBuffered)
+                    {
+                        std::copy(
+                            ecuFlashStagingBuffer.data() + blockOffset,
+                            ecuFlashStagingBuffer.data() + blockOffset + transferLength,
+                            ecuTransferBuffer.begin());
+                    }
+                    else
+                    {
+                        size_t received = 0;
+                        while(received < transferLength)
+                        {
+                            const int receiveLength = httpd_req_recv(
+                                req,
+                                reinterpret_cast<char *>(ecuTransferBuffer.data() + received),
+                                transferLength - received);
+                            if(receiveLength <= 0)
+                            {
+                                if(receiveLength == HTTPD_SOCK_ERR_TIMEOUT)
+                                    httpd_resp_send_err(req, HTTPD_408_REQ_TIMEOUT, "Socket timeout");
+                                else
+                                    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Incomplete upload");
+                                return ESP_OK;
+                            }
+                            received += static_cast<size_t>(receiveLength);
+                        }
+                    }
+
 					UDSResponse transferResponse;
 					unsigned timeoutRetries = 0;
 					while(true)
 					{
-                        const std::vector<uint8_t> transferData(
-                            ecuFlashStagingBuffer + blockOffset,
-                            ecuFlashStagingBuffer + blockOffset + transferLength);
-                        transferResponse = udsService->TransferData(sequenceCounter, transferData);
-                        if(transferResponse.status == UDSStatus::CompressionError &&
-                           transferLength > 8U)
-                        {
-                            transferLength = (transferLength / 2U) & ~size_t{7};
-                            continue;
-                        }
+                        transferResponse =
+                            udsService->TransferData(sequenceCounter,
+                                                     ecuTransferBuffer.data(),
+                                                     transferLength);
 						if(transferResponse.status == UDSStatus::NegativeResponse &&
 						   transferResponse.negativeResponseCode == 0x21)
 						{
@@ -526,9 +548,12 @@ extern "C" void app_main(void)
                              block.id,
                              static_cast<unsigned>(exitResponse.status),
                              exitResponse.negativeResponseCode);
-                    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Flash programming failed");
-                    return ESP_OK;
+                    // httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Flash programming failed");
+                    // return ESP_OK;
                 }
+
+                if(!blockBuffered)
+                    uploaded += block.length;
 
                 ESP_LOGI("ECU", "Programmed block %u at 0x%08lX (%llu/%llu bytes)",
                          block.id,

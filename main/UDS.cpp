@@ -50,8 +50,21 @@ UDSResponse UDS::Request(uint8_t service, const uint8_t *payload, size_t payload
     std::vector<uint8_t> request;
     request.reserve(payloadLength + 1);
     request.push_back(service);
-    if(payloadLength != 0)
-        request.insert(request.end(), payload, payload + payloadLength);
+	if(payloadLength != 0)
+	{
+		request.insert(request.end(), payload, payload + payloadLength);
+	}
+
+	return RequestPrepared(service, request.data(), request.size(), expectResponse);
+}
+
+UDSResponse UDS::RequestPrepared(uint8_t service,
+                                 const uint8_t *request,
+                                 size_t requestLength,
+                                 bool expectResponse)
+{
+	if(_transport == nullptr || !_delay || request == nullptr || requestLength == 0)
+		return {UDSStatus::InvalidArgument};
 
     UDSResponse response;
     std::atomic<bool> complete(false);
@@ -103,7 +116,7 @@ UDSResponse UDS::Request(uint8_t service, const uint8_t *payload, size_t payload
             _transport->UnRegisterReceiveCallBack(callbackId);
         return {UDSStatus::Timeout};
     }
-    _transport->Send(request.data(), request.size());
+    _transport->Send(request, requestLength);
 
     if(!expectResponse)
         return response;
@@ -431,29 +444,47 @@ UDSResponse UDS::RequestUpload(uint64_t address, uint64_t size, uint8_t dataForm
 
 UDSResponse UDS::TransferData(uint8_t blockSequenceCounter, const std::vector<uint8_t> &data)
 {
+    return TransferData(blockSequenceCounter, data.data(), data.size());
+}
+
+UDSResponse UDS::TransferData(uint8_t blockSequenceCounter,
+                              const uint8_t *data,
+                              size_t dataLength)
+{
+    // UDS is a synchronous, stateful service, so only one TransferData request
+    // can be active at a time. Fixed storage avoids allocating and freeing a
+    // multi-kilobyte request for every transfer block.
+    static std::array<uint8_t, maximumLZ4BlockLength> request{};
+
     if(_lz4Transfer && _transferDirection == TransferDirection::Download)
     {
-        if(data.empty() || data.size() > maximumLZ4BlockLength || _maximumBlockLength <= 4)
+        if(data == nullptr || dataLength == 0 ||
+           dataLength > maximumLZ4BlockLength ||
+           _maximumBlockLength <= 4 ||
+           _maximumBlockLength > request.size())
             return {UDSStatus::InvalidArgument};
 
-        std::vector<uint8_t> payload{
-            blockSequenceCounter,
-            static_cast<uint8_t>(data.size() >> 8),
-            static_cast<uint8_t>(data.size())
-        };
+        request[0] = 0x36;
+        request[1] = blockSequenceCounter;
+        request[2] = static_cast<uint8_t>(dataLength >> 8);
+        request[3] = static_cast<uint8_t>(dataLength);
         const size_t compressedCapacity = _maximumBlockLength - 4;
-        payload.resize(3 + compressedCapacity);
         size_t compressedLength = compressedCapacity;
-        if(Kernel::EncodeLZ4Block(data.data(), data.size(), payload.data() + 3,
+        if(Kernel::EncodeLZ4Block(data, dataLength, request.data() + 4,
                                   compressedLength) != Kernel::LZ4EncodeResult::Success)
             return {UDSStatus::CompressionError};
-        payload.resize(3 + compressedLength);
-        return Request(0x36, payload);
+        return RequestPrepared(0x36, request.data(), 4 + compressedLength, true);
     }
 
-    std::vector<uint8_t> payload{blockSequenceCounter};
-    payload.insert(payload.end(), data.begin(), data.end());
-    UDSResponse response = Request(0x36, payload);
+    if(dataLength > request.size() - 2 || (data == nullptr && dataLength != 0))
+        return {UDSStatus::InvalidArgument};
+
+    request[0] = 0x36;
+    request[1] = blockSequenceCounter;
+    if(dataLength != 0)
+        std::copy_n(data, dataLength, request.data() + 2);
+    UDSResponse response =
+        RequestPrepared(0x36, request.data(), dataLength + 2, true);
     if(!_lz4Transfer || _transferDirection != TransferDirection::Upload || !response.Ok())
         return response;
 
