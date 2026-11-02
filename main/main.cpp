@@ -203,7 +203,18 @@ extern "C" void app_main(void)
         return 0;
     });
 
-    static IECUService *ecuService = new ECUService_E92(_ecuISOTPService, [](uint32_t ms) { vTaskDelay(pdMS_TO_TICKS(ms)); });
+    static const CANIdentifier_t consoleListenId = {.CANIdentifier = 0x608, .CANBusNumber = 0};
+    static const CANIdentifier_t consoleTransmitId = {.CANIdentifier = 0x600, .CANBusNumber = 0};
+    ICommunicationService *const ecuConsole = _canService->GetISOTPService(consoleListenId, consoleTransmitId);
+    ecuConsole->RegisterReceiveCallBack([](communication_send_callback_t, const void *data, size_t length) -> size_t {
+        const char *const text = static_cast<const char *>(data);
+        size_t printableLength = length;
+        if(printableLength > 0)
+            printf("%.*s", static_cast<int>(printableLength), text);
+        return length;
+    });
+
+    static IECUService *ecuService = new ECUService_E78(_ecuISOTPService, [](uint32_t ms) { vTaskDelay(pdMS_TO_TICKS(ms)); });
     static UDS *udsService = new UDS(_ecuISOTPService, [](uint32_t ms) { vTaskDelay(pdMS_TO_TICKS(ms)); });
 
     const httpd_uri_t uploadKernelPost = {
@@ -212,7 +223,7 @@ extern "C" void app_main(void)
         .handler    = [ecuService](httpd_req_t *req) 
         {
             constexpr size_t kernelChunkSize = 2000;
-            constexpr uint32_t kernelLoadAddress = 0x40010000;
+            constexpr uint32_t kernelLoadAddress = 0x40014000;
             const int total_len = req->content_len;
             if(total_len <= 0) {
                 httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Kernel data is empty");
@@ -335,41 +346,60 @@ extern "C" void app_main(void)
                 return ESP_OK;
             }
 
-            std::vector<UDSFlashBlock> uploadBlocks;
+            struct UploadBlock
+            {
+                UDSFlashBlock flashBlock;
+                uint32_t uploadedLength;
+            };
+
+            std::vector<UploadBlock> uploadBlocks;
             uint64_t expectedAddress = parsedAddress;
             uint64_t remainingUpload = lengthValue;
+            uint64_t programmedLength = 0;
             for(const UDSFlashBlock &block : flashBlocks)
             {
                 if(block.address != expectedAddress)
                     continue;
-                if(block.length > remainingUpload)
-                    break;
-                uploadBlocks.push_back(block);
+
+                const uint32_t uploadedBlockLength = static_cast<uint32_t>(
+                    std::min<uint64_t>(remainingUpload, block.length));
+                uploadBlocks.push_back({block, uploadedBlockLength});
                 expectedAddress += block.length;
-                remainingUpload -= block.length;
+                remainingUpload -= uploadedBlockLength;
+                programmedLength += block.length;
                 if(remainingUpload == 0)
                     break;
             }
             if(uploadBlocks.empty() || remainingUpload != 0)
             {
                 httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
-                                    "Upload must contain complete physical flash blocks");
+                                    "Upload address must begin on a physical flash block and fit the flash map");
                 return ESP_OK;
             }
 
-            uint64_t uploaded = 0;
-            for(const UDSFlashBlock &block : uploadBlocks)
+            if(programmedLength != lengthValue)
             {
+                ESP_LOGI("ECU", "Padding upload from 0x%llX to 0x%llX bytes with erased 0xFF data",
+                         static_cast<unsigned long long>(lengthValue),
+                         static_cast<unsigned long long>(programmedLength));
+            }
+
+            uint64_t uploaded = 0;
+            for(const UploadBlock &uploadBlock : uploadBlocks)
+            {
+                const UDSFlashBlock &block = uploadBlock.flashBlock;
+                const size_t uploadedBlockLength = uploadBlock.uploadedLength;
                 const bool blockBuffered = block.length <= ecuFlashStagingBufferSize;
                 if(blockBuffered)
                 {
+                    std::fill_n(ecuFlashStagingBuffer.begin(), block.length, 0xFFU);
                     size_t received = 0;
-                    while(received < block.length)
+                    while(received < uploadedBlockLength)
                     {
                         const int receiveLength = httpd_req_recv(
                             req,
                             reinterpret_cast<char *>(ecuFlashStagingBuffer.data() + received),
-                            block.length - received);
+                            uploadedBlockLength - received);
                         if(receiveLength <= 0)
                         {
                             if(receiveLength == HTTPD_SOCK_ERR_TIMEOUT)
@@ -389,7 +419,7 @@ extern "C" void app_main(void)
                         return ESP_OK;
                     }
 
-                    uploaded += block.length;
+                    uploaded += uploadedBlockLength;
                     if(uploadedHash == block.sha256)
                     {
                         ESP_LOGI("ECU", "Block %u at 0x%08lX unchanged (%llu/%llu bytes)",
@@ -473,13 +503,16 @@ extern "C" void app_main(void)
                     }
                     else
                     {
+                        const size_t bytesFromUpload = blockOffset < uploadedBlockLength
+                            ? std::min(transferLength, uploadedBlockLength - blockOffset)
+                            : 0U;
                         size_t received = 0;
-                        while(received < transferLength)
+                        while(received < bytesFromUpload)
                         {
                             const int receiveLength = httpd_req_recv(
                                 req,
                                 reinterpret_cast<char *>(ecuTransferBuffer.data() + received),
-                                transferLength - received);
+                                bytesFromUpload - received);
                             if(receiveLength <= 0)
                             {
                                 if(receiveLength == HTTPD_SOCK_ERR_TIMEOUT)
@@ -490,6 +523,10 @@ extern "C" void app_main(void)
                             }
                             received += static_cast<size_t>(receiveLength);
                         }
+                        std::fill(
+                            ecuTransferBuffer.begin() + bytesFromUpload,
+                            ecuTransferBuffer.begin() + transferLength,
+                            0xFFU);
                     }
 
 					UDSResponse transferResponse;
@@ -548,12 +585,12 @@ extern "C" void app_main(void)
                              block.id,
                              static_cast<unsigned>(exitResponse.status),
                              exitResponse.negativeResponseCode);
-                    // httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Flash programming failed");
-                    // return ESP_OK;
+                    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Flash programming failed");
+                    return ESP_OK;
                 }
 
                 if(!blockBuffered)
-                    uploaded += block.length;
+                    uploaded += uploadedBlockLength;
 
                 ESP_LOGI("ECU", "Programmed block %u at 0x%08lX (%llu/%llu bytes)",
                          block.id,
