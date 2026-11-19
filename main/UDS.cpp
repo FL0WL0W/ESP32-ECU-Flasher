@@ -74,7 +74,7 @@ UDSResponse UDS::RequestPrepared(uint8_t service,
     if(expectResponse)
     {
         callbackId = _transport->RegisterReceiveCallBack(
-            [&response, &complete, &pending, service](communication_send_callback_t, const void *data, size_t length) -> size_t {
+            [&response, &complete, &pending, service](ICommunicationService *sendService, const void *data, size_t length) -> size_t {
                 if(complete.load(std::memory_order_acquire) || data == nullptr || length == 0)
                     return 0;
 
@@ -277,7 +277,7 @@ UDSResponse UDS::GetFlashBlockMap(std::vector<UDSFlashBlock> &blocks)
     const communication_receive_callback_id_t callbackId =
         _transport->RegisterReceiveCallBack(
             [&blocks, &blockCount, &response, &complete, &activity]
-            (communication_send_callback_t, const void *data, size_t length) -> size_t
+            (ICommunicationService *sendService, const void *data, size_t length) -> size_t
             {
                 if(complete.load(std::memory_order_acquire) || data == nullptr || length == 0)
                     return 0;

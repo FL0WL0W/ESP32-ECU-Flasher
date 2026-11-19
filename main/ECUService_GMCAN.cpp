@@ -35,7 +35,7 @@ ECUServiceErrorCode ECUService_GMCAN::SendAndWaitForResponse(uint8_t *data, size
 {
     bool responseReady = false;
     ECUServiceErrorCode response = ECU_SERVICE_ERROR_NONE;
-    communication_receive_callback_id_t callbackId = _ecuISOTPService->RegisterReceiveCallBack([&responseReady, &response, responseCondition](communication_send_callback_t send, const void *data, size_t length) -> size_t {
+    communication_receive_callback_id_t callbackId = _ecuISOTPService->RegisterReceiveCallBack([&responseReady, &response, responseCondition](ICommunicationService *sendService, const void *data, size_t length) -> size_t {
         if(responseReady)
         {
             return 0; // If response is already ready, do not process further
@@ -67,7 +67,7 @@ ECUServiceErrorCode ECUService_GMCAN::Connect()
 {
     volatile uint32_t queryReadFlags = 0;
     uint32_t osid = 0; // Buffer to hold the OSID
-    communication_receive_callback_id_t callbackId = _ecuISOTPService->RegisterReceiveCallBack([&osid, &queryReadFlags](communication_send_callback_t send, const void *data, size_t length) -> size_t {
+    communication_receive_callback_id_t callbackId = _ecuISOTPService->RegisterReceiveCallBack([&osid, &queryReadFlags](ICommunicationService *sendService, const void *data, size_t length) -> size_t {
         const uint8_t *dataBytes = reinterpret_cast<const uint8_t *>(data);
         if(length < 2)
             return 0;
@@ -140,7 +140,7 @@ ECUServiceErrorCode ECUService_GMCAN::QueryInformation(ECUInformation *info)
 {
     uint32_t queryReadFlags = 0;
     uint8_t vin[17] = {0}; // Buffer to hold the VIN
-    communication_receive_callback_id_t callbackId = _ecuISOTPService->RegisterReceiveCallBack([&vin, &queryReadFlags](communication_send_callback_t send, const void *data, size_t length) -> size_t {
+    communication_receive_callback_id_t callbackId = _ecuISOTPService->RegisterReceiveCallBack([&vin, &queryReadFlags](ICommunicationService *sendService, const void *data, size_t length) -> size_t {
         const uint8_t *dataBytes = reinterpret_cast<const uint8_t *>(data);
         if(length < 2)
             return 0;

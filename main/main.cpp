@@ -198,19 +198,33 @@ extern "C" void app_main(void)
     _ecuISOTPService = _canService->GetISOTPService(listenId, transmitId);
 
     //setup link between socket and isotp service
-    _ecuISOTPService->RegisterReceiveCallBack([_ecuWebSocketService](communication_send_callback_t send, const void *data, size_t length) {
+    _ecuISOTPService->RegisterReceiveCallBack([_ecuWebSocketService](ICommunicationService *sendService, const void *data, size_t length) {
         esp_log_buffer_hex("ISOTP", data, std::min(length, (size_t)64));
         return 0;
     });
 
+    //ecuconsole
     static const CANIdentifier_t consoleListenId = {.CANIdentifier = 0x608, .CANBusNumber = 0};
     static const CANIdentifier_t consoleTransmitId = {.CANIdentifier = 0x600, .CANBusNumber = 0};
     ICommunicationService *const ecuConsole = _canService->GetISOTPService(consoleListenId, consoleTransmitId);
-    ecuConsole->RegisterReceiveCallBack([](communication_send_callback_t, const void *data, size_t length) -> size_t {
+    ecuConsole->RegisterReceiveCallBack([](ICommunicationService *sendService, const void *data, size_t length) -> size_t {
         const char *const text = static_cast<const char *>(data);
         size_t printableLength = length;
         if(printableLength > 0)
             printf("%.*s", static_cast<int>(printableLength), text);
+        return length;
+    });
+
+    static const CANIdentifier_t efiGenieListenId = {.CANIdentifier = 0x609, .CANBusNumber = 0};
+    static const CANIdentifier_t efiGenieTransmitId = {.CANIdentifier = 0x601, .CANBusNumber = 0};
+    ICommunicationService *const efiGenieCommunicationService = _canService->GetISOTPService(efiGenieListenId, efiGenieTransmitId);
+    ICommunicationService *const webSocketCommunicationService = new Esp32IdfCommunicationService_WebSocket(server, "/EFIGenieCommunication");
+    efiGenieCommunicationService->RegisterReceiveCallBack([webSocketCommunicationService](ICommunicationService *sendService, const void *data, size_t length) {
+        webSocketCommunicationService->Send(data, length);
+        return length;
+    });
+    webSocketCommunicationService->RegisterReceiveCallBack([efiGenieCommunicationService](ICommunicationService *sendService, const void *data, size_t length) {
+        efiGenieCommunicationService->Send(data, length);
         return length;
     });
 
