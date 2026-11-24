@@ -17,7 +17,7 @@
 #include "http_server.h"
 #include "esp_ota_ops.h"
 #include "esp_log.h"
-#include "mbedtls/sha256.h"
+#include "psa/crypto.h"
 #include "mount.h"
 #include "ECUService_E92.h"
 #include "ECUService_E38.h"
@@ -199,7 +199,7 @@ extern "C" void app_main(void)
 
     //setup link between socket and isotp service
     _ecuISOTPService->RegisterReceiveCallBack([_ecuWebSocketService](ICommunicationService *sendService, const void *data, size_t length) {
-        esp_log_buffer_hex("ISOTP", data, std::min(length, (size_t)64));
+        ESP_LOG_BUFFER_HEX("ISOTP", data, std::min(length, (size_t)64));
         return 0;
     });
 
@@ -426,8 +426,15 @@ extern "C" void app_main(void)
                     }
 
                     std::array<uint8_t, 32> uploadedHash{};
-                    if(mbedtls_sha256(ecuFlashStagingBuffer.data(), block.length,
-                                    uploadedHash.data(), 0) != 0)
+                    size_t hash_len = 0;
+                    psa_crypto_init(); // Safe to call multiple times; required once at startup
+                    psa_status_t status = psa_hash_compute(
+                        PSA_ALG_SHA_256,
+                        ecuFlashStagingBuffer.data(), block.length,
+                        uploadedHash.data(), 32,
+                        &hash_len
+                    );
+                    if(status != 0)
                     {
                         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "SHA-256 failed");
                         return ESP_OK;

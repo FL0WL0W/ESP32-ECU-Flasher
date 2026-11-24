@@ -3,7 +3,7 @@ set(EmbeddedIOServicesHardwareAbstraction_Path ${LIBRARIES_DIR}/EmbeddedIOServic
 
 idf_component_register( SRCS "JustAFile.cpp"
                         INCLUDE_DIRS "."
-                        PRIV_REQUIRES driver esp_http_server esp_driver_gpio esp_driver_gptimer esp_adc)
+                        PRIV_REQUIRES driver esp_http_server esp_driver_gpio esp_driver_gptimer esp_adc esp_driver_ledc esp_driver_uart)
 
 include(FetchContent)
 
