@@ -794,8 +794,8 @@ extern "C" void app_main(void)
     httpd_register_uri_handler(server, &downloadECUPost);
 
     //do this last since it takes up all endpoints
-    mount_mmrofs("/mm");
-    register_file_handler_http_server("/mm");
+    // mount_mmrofs("/mm");
+    // register_file_handler_http_server("/mm");
 
     while(true)
     {

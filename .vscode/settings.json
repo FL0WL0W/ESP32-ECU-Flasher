@@ -36,5 +36,6 @@
         }
       }
     ]
-  }
+  },
+  "idf.flashType": "UART"
 }
